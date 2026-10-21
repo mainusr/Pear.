@@ -148,6 +148,14 @@ struct DetailView: View {
             for await group in AddonClient.shared.streamUpdates(for: sid, type: item.type, addons: addons) {
                 guard showSources else { return }
                 streams = AddonClient.ordered(streams + [group], by: addons)
+                // Remembered source: as soon as its add-on answers, play from it instead of waiting for the user.
+                if downloadTarget == nil, let pref = pins.preferred(for: imdb), group.0.id == pref.addonID {
+                    let playable = group.1.filter(\.isPlayable)
+                    if let s = playable.first(where: { $0.signature == pref.signature }) ?? playable.first {
+                        play(group.0, s)
+                        return
+                    }
+                }
             }
         }
     }
@@ -774,6 +782,7 @@ struct DetailView: View {
 
     private func play(_ addon: Addon, _ s: StreamItem) {
         guard let t = s.playTarget, let imdb = imdbID else { return }
+        pins.remember(Pin(addonID: addon.id, signature: s.signature), for: imdb)
         let ep = isSeries ? episodes.first(where: { $0.id == episode }) : nil
         pendingPlay = PlayRequest(url: t.url, headers: s.requestHeaders, item: item,
                                   key: isSeries ? "\(season):\(episode)" : "movie", imdb: imdb,

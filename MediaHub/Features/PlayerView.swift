@@ -510,6 +510,7 @@ struct PlayerScreen: View {
     @Environment(LibraryPrefs.self) private var libraryPrefs
     @Environment(ThemeStore.self) private var theme
     @Environment(AddonStore.self) private var store
+    @Environment(PinnedSources.self) private var pins
     @Environment(\.openURL) private var openURL
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage(SubtitleStyle.storageKey) private var subJSON = ""
@@ -1444,6 +1445,7 @@ struct PlayerScreen: View {
         if addon.id == current.sourceAddonID && s.signature == current.sourceSignature { closeSources(); return }
         let resume = model.playhead.position
         save()
+        pins.remember(Pin(addonID: addon.id, signature: s.signature), for: current.imdb)
         let next = PlayRequest(url: t.url, headers: s.requestHeaders, item: current.item, key: current.key, imdb: current.imdb,
                                season: current.season, episode: current.episode, episodeTitle: current.episodeTitle,
                                logo: current.logo, thumb: current.thumb,

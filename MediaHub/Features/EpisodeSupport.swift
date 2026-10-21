@@ -154,10 +154,10 @@ enum SourceResolver {
             return (g.0, s)
         }
 
-        // The source you are watching now wins (so "next episode" keeps your quality / provider), then the pin.
+        // The source you are watching now wins (so "next episode" keeps your quality / provider), then the last source you picked, then the pin.
         var chosen: (Addon, StreamItem)?
         if let a = current.sourceAddonID { chosen = match(a, current.sourceSignature) }
-        if chosen == nil, let pin = pins.pin(for: current.imdb) { chosen = match(pin.addonID, pin.signature) }
+        if chosen == nil, let pin = pins.preferred(for: current.imdb) { chosen = match(pin.addonID, pin.signature) }
         if chosen == nil {
             for g in ordered { if let s = g.1.first(where: \.isPlayable) { chosen = (g.0, s); break } }
         }
