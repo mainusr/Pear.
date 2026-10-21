@@ -707,11 +707,14 @@ struct PlayerScreen: View {
             VStack(spacing: 0) {
                 HStack { circleButton("xmark", size: 42, icon: 16) { close() }; Spacer() }
                 Spacer()
-                transport
-                Spacer()
                 bottomBar
             }
             .padding(.horizontal, 24).padding(.top, 4).padding(.bottom, 6)
+
+            // Own layer so the transport sits at the true vertical center of the screen,
+            // independent of the close row above and the tall bottom bar below.
+            transport
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
         }
         .foregroundStyle(.white)
     }
