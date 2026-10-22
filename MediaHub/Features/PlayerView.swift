@@ -88,11 +88,19 @@ final class PlayerModel {
     @ObservationIgnored private var isShutDown = false
     @ObservationIgnored private var preferredSubtitleLanguage: String?
     @ObservationIgnored private var autoSelectSubtitle = false
+    @ObservationIgnored private var backgroundedAt: Date?
+    @ObservationIgnored private var backgroundPosition: Double = 0
     @ObservationIgnored private var rateTask: Task<Void, Never>?
     /// The engine may drop back to 1x on a (re)load, seek or pause; the chosen speed is pushed again on the next `.playing`.
     @ObservationIgnored private var rateStale = false
 
     /// The viewer's default subtitle language (nil = off). Applied when tracks become available.
+    /// A choice remembered for this title (a language, or "off") beats the global default.
+    func configure(defaultSubtitleLanguage lang: String?, show: String) {
+        if let saved = SubtitleMemory.get(show) { configure(defaultSubtitleLanguage: saved == SubtitleMemory.off ? nil : saved); return }
+        configure(defaultSubtitleLanguage: lang)
+    }
+
     func configure(defaultSubtitleLanguage lang: String?) {
         if preferredSubtitleLanguage == nil { preferredSubtitleLanguage = lang }
     }
@@ -131,6 +139,8 @@ final class PlayerModel {
                 P2PManager.shared.stop() // switched from a torrent to a direct source: tear the engine down
             }
             var options = LoadOptions(httpHeaders: r.headers)
+            // Declares the text tracks to AVKit too, so the Picture in Picture window can show subtitles itself.
+            options.prepareNativeSubtitles = PiPController.isEnabled
             // ~10 min of look-ahead (150 x ~4 s segments). That is the largest window the engine accepts without
             // opting out of its 2 GiB retention cap, so a seek or a reconnect never competes with a whole-film
             // download for bandwidth. Raise it if you'd rather trade disk and data for a longer cushion.
@@ -309,7 +319,7 @@ final class PlayerModel {
         if autoSelectSubtitle, !subtitleTracks.isEmpty {
             autoSelectSubtitle = false
             if activeSubtitleID == nil, let lang = preferredSubtitleLanguage, let t = bestSubtitle(for: lang) {
-                selectSubtitle(t)
+                selectSubtitle(t, remember: false)
                 return
             }
         }
@@ -339,23 +349,24 @@ final class PlayerModel {
         for _ in 0..<20 where !isPlaying { try? await Task.sleep(for: .milliseconds(500)) }
         guard !Task.isCancelled, onlineFor == r.id, activeSubtitleID == nil, bestSubtitle(for: lang) == nil,
               let s = list.first(where: { SubLanguages.matches($0.lang, lang) }) else { return }
-        useOnline(s)
+        useOnline(s, remember: false)
     }
 
     /// Registers the downloaded file as an external track (once) and switches to it.
-    func useOnline(_ s: OnlineSubtitle) {
+    func useOnline(_ s: OnlineSubtitle, remember: Bool = true) {
         guard let engine else { return }
         if let id = addedOnline[s.id], let t = subtitleTracks.first(where: { Reflect.int($0.id) == id }) {
-            selectSubtitle(t); return
+            selectSubtitle(t, remember: remember); return
         }
         let info = engine.addExternalSubtitleTrack(
             ExternalSubtitleTrack(url: s.url, name: "OpenSubtitles", language: s.lang, httpHeaders: [:], formatHint: "srt"))
         addedOnline[s.id] = Reflect.int(info.id)
         subtitleTracks = engine.subtitleTracks
-        selectSubtitle(info)
+        selectSubtitle(info, remember: remember)
     }
 
-    func selectSubtitle(_ t: TrackInfo?) {
+    /// `remember`: a pick made by the viewer is stored for this title; automatic picks are not.
+    func selectSubtitle(_ t: TrackInfo?, remember: Bool = true) {
         guard let engine else { return }
         allCues = []; mappedCount = 0; mappedFirst = nil; invalidateCueWindow()
         if let t {
@@ -363,11 +374,13 @@ final class PlayerModel {
             activeSubtitleID = Reflect.int(t.id)
             preferredSubtitleLanguage = Reflect.string(t, "language") ?? Reflect.string(t, "name")
             ingest(engine.subtitleCues)
+            if remember, let show = lastRequest?.imdb, let lang = preferredSubtitleLanguage { SubtitleMemory.set(lang, for: show) }
         } else {
             engine.clearSubtitle()
             activeSubtitleID = nil
             activeCues = []
             preferredSubtitleLanguage = nil
+            if remember, let show = lastRequest?.imdb { SubtitleMemory.set(SubtitleMemory.off, for: show) }
         }
         syncCueClock()
         refreshActiveCues()
@@ -382,6 +395,33 @@ final class PlayerModel {
 
     func togglePlay() {
         if p2pDropped { resumeAfterDrop() } else { engine?.togglePlayPause() }
+    }
+
+    /// The app went to the background: bank where we are, because a paused video's pipeline is released after a while.
+    func noteBackgrounded() { backgroundedAt = Date(); backgroundPosition = playhead.position }
+
+    /// The app is active again. A paused (or system-paused) session that sat in the background has had its video
+    /// pipeline torn down by the engine, which leaves a black screen: rebuild it at the same position, still paused.
+    func restoreAfterBackground(pipActive: Bool) async {
+        guard let since = backgroundedAt else { return }
+        backgroundedAt = nil
+        guard let engine, !isShutDown, !pipActive, !p2pDropped, isPaused, error == nil,
+              lastRequest?.p2p == nil else { return }
+        // The engine empties its duration when it releases the pipeline; past its grace window it has certainly done so.
+        guard Double(engine.duration) <= 0 || Date().timeIntervalSince(since) > 90 else { return }
+        let pos = backgroundPosition
+        playhead.position = pos; holdPosition = pos
+        setBuffering(true)
+        do {
+            try await engine.reloadAtCurrentPosition()
+            engine.pause()
+            holdPosition = nil; setBuffering(false)
+            playhead.position = pos
+        } catch {
+            holdPosition = nil; setBuffering(false)
+            // Reopening in place failed (the link may have expired): start the source again at the same spot.
+            if let r = lastRequest { await start(r, resume: pos, replacing: true, exact: true); engine.pause() }
+        }
     }
 
     /// Reopens the torrent at the saved position (or at t, for a seek made while it was torn down).
@@ -644,7 +684,8 @@ struct PlayerScreen: View {
         }
         // Same for leaving the app while playing (PiP, background audio): the system may end it without notice.
         .onChange(of: scenePhase) { _, p in
-            if p == .background { logPlayTime(); save(isFinal: false) }
+            if p == .background { model.noteBackgrounded(); logPlayTime(); save(isFinal: false) }
+            if p == .active { Task { await model.restoreAfterBackground(pipActive: pip.isActive) } }
         }
         .onChange(of: model.error) { _, _ in updateIdleTimer() }
         .onChange(of: showControls, initial: true) { _, shown in
@@ -1584,7 +1625,7 @@ struct PlayerScreen: View {
     // MARK: Actions
 
     private func begin() async {
-        model.configure(defaultSubtitleLanguage: subLang == "off" ? nil : subLang)
+        model.configure(defaultSubtitleLanguage: subLang == "off" ? nil : subLang, show: current.imdb)
         await model.start(current, resume: resumePoint(for: current))
         scheduleHide()
     }
@@ -1969,5 +2010,21 @@ private struct EpisodePanel: View {
         }
         .buttonStyle(PressableStyle())
         .disabled(switching != nil)
+    }
+}
+
+
+/// The subtitle language picked for each title (or "off"), so the next episode or the next time it is opened starts the same way.
+enum SubtitleMemory {
+    static let key = "last.subtitles"
+    static let off = "off"
+    static func get(_ show: String) -> String? {
+        (UserDefaults.standard.dictionary(forKey: key) as? [String: String])?[show]
+    }
+    static func set(_ value: String, for show: String) {
+        var all = (UserDefaults.standard.dictionary(forKey: key) as? [String: String]) ?? [:]
+        guard all[show] != value else { return }
+        all[show] = value
+        UserDefaults.standard.set(all, forKey: key)
     }
 }

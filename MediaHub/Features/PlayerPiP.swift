@@ -79,6 +79,8 @@ final class PiPController: NSObject {
         isActive = on
         // The engine keeps its pipeline alive while the window is open and hands items over in place on a next-episode load.
         engine?.pictureInPictureActive = on
+        // The on-screen subtitle overlay can't draw inside the PiP window: AVKit renders the engine's native track there.
+        engine?.setNativeSubtitleRendering(on)
     }
 }
 
